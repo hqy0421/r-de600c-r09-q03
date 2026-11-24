@@ -701,6 +701,78 @@ one. ``unchanged_scope`` selects the comparison key accordingly:
    there is a real publication time to compare against — never a per-batch
    ``now()`` stamp.
 
+.. _sdk-publication:
+
+Publication and recovery
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+A batch — one ``run_id`` — spans two backends that cannot commit together:
+its values live in ClickHouse, its ``runs`` row and publication state in
+PostgreSQL. energydb makes that split explicit with a ``run_publication``
+row per batch, so a half-finished batch is *identifiable*, not merely
+inferable:
+
+``pending``
+   The ``runs`` row exists; the values are being written (or were written but
+   confirmation was never recorded). **Hidden from reads.**
+``confirmed``
+   Values acknowledged by ClickHouse *and* the run recorded. The only state
+   reads serve.
+``failed``
+   The ClickHouse write raised. Left for recovery to finish or abandon.
+``reopened``
+   A previously confirmed batch withdrawn for repair. Hidden until
+   re-confirmed.
+
+Writes walk ``pending`` → (ClickHouse) → ``confirmed``. Reads never see a
+batch that is not ``confirmed``: the read path filters unconfirmed
+``run_id``s out of both ``series_values`` and ``run_series`` server-side, so
+a half-written batch can neither shadow an older confirmed value in a
+"latest" read nor appear as a run that touched a series.
+
+Both failure windows are recoverable by ``run_id``:
+
+- **values written, run record not written** — the ClickHouse write
+  succeeded but PostgreSQL could not record the confirmation. The write
+  raises :class:`~energydb.errors.PublicationConfirmationError` carrying the
+  ``run_id``; the values stay hidden until the batch is confirmed.
+- **run record written, values not written** — the ClickHouse write raised.
+  The publication is marked ``failed`` (still locatable), and the original
+  error propagates.
+
+Recovery locates a batch and finishes it:
+
+.. code-block:: python
+
+   # Finish one specific batch (idempotent; a confirmed batch is a no-op).
+   client.resume_publication(run_id)
+
+   # Sweep every incomplete batch, e.g. for a scheduler's workflow.
+   report = client.recover_incomplete(workflow_id="nightly-etl")
+
+``resume_publication`` probes ClickHouse for the batch's values. If they are
+present it repairs the ``run_series`` mapping when the concurrent insert lane
+failed, flips the publication to ``confirmed``, and returns the updated row —
+after which reads serve the version. If the values never reached ClickHouse
+it marks the batch ``failed`` and raises
+:class:`~energydb.errors.PublicationStateError`: re-running the original write
+under the same ``run_id`` (idempotent) is the way to finish it.
+
+``recover_incomplete`` sweeps in bulk, returning one
+``{run_id, state, action, detail}`` entry per batch and never aborting on a
+single un-resumable one. ``dry_run=True`` reports what *would* happen without
+mutating anything.
+
+A confirmed batch can also be withdrawn deliberately — re-open the
+publication to make a version invisible without deleting its values — and
+re-confirmed later:
+
+.. code-block:: python
+
+   client.reopen_publication(run_id)   # reads fall back to the older vintage
+   client.resume_publication(run_id)   # restore
+
+
 Reading
 ~~~~~~~
 
@@ -1214,7 +1286,11 @@ the package root, so ``from energydb import SeriesNotFoundError`` works.
    │   ├── ManifestError          — structurally invalid manifest
    │   └── UnchangedScopeError    — scope would drop OVERLAPPING revisions
    ├── ConfigurationError         — client / environment misconfiguration
-   └── IncompatibleUnitError      — dimensionally incompatible unit conversion
+   ├── IncompatibleUnitError      — dimensionally incompatible unit conversion
+   └── PublicationError           — a batch is mid-state across the two backends
+       ├── PublicationStateError  — the requested transition is not allowed
+       ├── PublicationNotFoundError — no publication for that run_id
+       └── PublicationConfirmationError — values written, confirmation not recorded
 
 Catch the branch you mean:
 
@@ -1249,13 +1325,16 @@ Catch the branch you mean:
 
 .. note::
 
-   **Every class energydb raises also subclasses** ``ValueError`` — every
-   subclass in the tree above does, though the ``EnergyDBError`` base
-   itself does not (nothing raises it directly). Broad
+   **Most classes energydb raises also subclass** ``ValueError`` — every
+   subclass in the tree above except :class:`~energydb.errors.PublicationError`
+   and :class:`~energydb.errors.PublicationConfirmationError` does, though the
+   ``EnergyDBError`` base itself does not (nothing raises it directly). Broad
    ``except ValueError`` handlers therefore catch all of them, which keeps
    generic error-handling code working — but the typed classes are what you
    want in new code, because message text is not a contract and the
-   structured fields are.
+   structured fields are. The publication family deliberately buckles that
+   trend: a half-finished batch is an operational state of the database, not
+   bad input, so a scheduler should not mistake it for a caller mistake.
 
 Structured fields
 ~~~~~~~~~~~~~~~~~
@@ -1283,6 +1362,12 @@ keyword-only and default to ``None`` when the raise site does not know them;
        triple), ``missing`` (every unresolved ``(owner, data_type, name)``)
    * - :class:`~energydb.errors.UnchangedScopeError`
      - ``overlapping_series_ids``
+   * - :class:`~energydb.errors.PublicationError` (and subclasses)
+     - ``run_id`` — the batch the failure concerns, so a scheduler can hand it
+       to :meth:`~energydb.AsyncClient.resume_publication`;
+       :class:`~energydb.errors.PublicationStateError` and
+       :class:`~energydb.errors.PublicationConfirmationError` also carry
+       ``state`` (the publication state it was in)
 
 What raises what
 ~~~~~~~~~~~~~~~~
@@ -1320,6 +1405,9 @@ What raises what
   cannot express the ``UNIQUE NULLS NOT DISTINCT`` edge key.
 - :class:`~energydb.IncompatibleUnitError` — a requested unit is not
   dimensionally compatible with the series' ``canonical_unit``.
+- :class:`~energydb.errors.PublicationError` — a batch did not reach a
+  consistent state across PostgreSQL and ClickHouse. See `Publication and
+  recovery`_.
 - ``RuntimeError`` — time-series ``read`` / ``write`` / ``read_relative`` on
   a txn-bound scope. Not part of the taxonomy: it reports misuse of the API's
   shape rather than bad data. Call them outside the ``with``-block.

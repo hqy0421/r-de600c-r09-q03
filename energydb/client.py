@@ -64,6 +64,7 @@ from energydb._io import (
 )
 from energydb._join import EdgeSeriesKey, SeriesKey
 from energydb._persist import create_edge, create_node_raw, register_tree_under
+from energydb._release import gate_td, recover_incomplete, resume_publication
 from energydb.diff import TreeDiff
 from energydb.errors import ConfigurationError, NodeNotFoundError, ValidationError
 from energydb.models import CREATE_SERIES_META_VIEW, SCHEMA, Base
@@ -362,7 +363,7 @@ class AsyncClient:
         self._require_root("delete")
         async with annotate_undefined_table(), self._pool.connection() as conn:
             if SCHEMA is None:
-                await conn.execute("DROP TABLE IF EXISTS series, runs, edge, node CASCADE")
+                await conn.execute("DROP TABLE IF EXISTS series, run_publication, runs, edge, node CASCADE")
             else:
                 await conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
             await conn.commit()
@@ -406,6 +407,24 @@ class AsyncClient:
         self._require_root("close")
         await self._pool.close()
         await asyncio.to_thread(self.td.close)
+
+    async def _read_td(self):
+        """The ``TimeDBClient`` a **read** should use: the shared one, gated so
+        values from unconfirmed publications are excluded.
+
+        The gate is what makes "only serve a version once both its run record
+        and its values are confirmed" hold at read time. It costs one PG
+        round-trip per read to fetch the unconfirmed id set — small by
+        construction (a partial index over the exception set) and empty in
+        steady state, in which case the untouched client is returned and the
+        read pays nothing extra.
+
+        Writes must never use this: they need the ungated client so a batch
+        sees its own rows during ``skip_unchanged`` comparison.
+        """
+        async with self._read_conn() as conn:
+            exclude = await runs_mod.unconfirmed_run_ids(conn)
+        return gate_td(self.td, exclude)
 
     def get_node(self, *names_or_path, uuid: UUID | None = None) -> NodeScope:
         """Return a :class:`NodeScope` for a node or subtree.
@@ -1103,7 +1122,7 @@ class AsyncClient:
             manifest = to_polars(df)
         result, _n_series, missing = await execute_read(
             self._pool,
-            self.td,
+            await self._read_td(),
             self,
             manifest=manifest,
             engine_meta=lambda: engine_meta_for_manifest(manifest),
@@ -1150,7 +1169,7 @@ class AsyncClient:
             manifest = to_polars(df)
         result, _n_series, missing = await execute_read(
             self._pool,
-            self.td,
+            await self._read_td(),
             self,
             manifest=manifest,
             engine_meta=lambda: engine_meta_for_manifest(manifest),
@@ -1192,12 +1211,76 @@ class AsyncClient:
         return data
 
     async def read_runs_for_series(self, *, series_id: int) -> list[dict[str, Any]]:
-        """Return runs that wrote data for a given series_id, latest first."""
-        run_ids = await asyncio.to_thread(self.td.read_run_series, series_id=series_id)
+        """Return runs that wrote data for a given series_id, latest first.
+
+        Gated like every read: a run whose publication is not yet confirmed is
+        not reported as having touched the series, since its values are not
+        being served either.
+        """
+        td = await self._read_td()
+        run_ids = await asyncio.to_thread(td.read_run_series, series_id=series_id)
         if not run_ids:
             return []
         async with self._read_conn() as conn:
             return await runs_mod.get_runs(conn, run_ids)
+
+    async def resume_publication(self, run_id: int) -> dict[str, Any]:
+        """Finish a half-written batch (recovery): confirm it if its values exist.
+
+        The scheduler's repair action for the "data written, run record not
+        written" (and inverse) windows described in :func:`energydb._io.write_manifest`.
+        Locates the batch by ``run_id``, probes ClickHouse for its values, and
+        if they are present repairs the ``run_series`` mapping when needed and
+        flips the publication to ``confirmed`` so reads begin serving it. The
+        returned dict is the updated publication row (see
+        :func:`energydb.runs.get_publication`).
+
+        Idempotent: a ``confirmed`` batch returns unchanged. Raises
+        :class:`~energydb.errors.PublicationNotFoundError` if no such batch
+        exists, and :class:`~energydb.errors.PublicationStateError` if the values
+        never reached ClickHouse (re-run the original write with the same
+        ``run_id`` to finish it — the write path is idempotent).
+        """
+        return await resume_publication(self, run_id)
+
+    async def reopen_publication(self, run_id: int) -> dict[str, Any]:
+        """Withdraw a confirmed batch from reads without deleting its values.
+
+        Flips a ``confirmed`` publication to ``reopened``, which the read gate
+        treats like any other non-confirmed state: the version becomes invisible
+        and reads fall back to the previous confirmed vintage, while the stored
+        values stay intact. :meth:`resume_publication` re-confirms it.
+
+        Unlike a plain state ``UPDATE``, reopening goes through the same
+        transition check as the rest of the state machine, so a batch that is
+        ``pending`` (not yet servable) or absent is rejected with the typed
+        error rather than silently rewritten.
+        """
+        async with self._conn() as conn:
+            await runs_mod.reopen_publication(conn, run_id)
+            await conn.commit()
+            reopened = await runs_mod.get_publication(conn, run_id)
+        assert reopened is not None  # just reopened the row we read
+        return reopened
+
+
+    async def recover_incomplete(
+        self,
+        *,
+        workflow_id: str | None = None,
+        limit: int = 100,
+        dry_run: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Sweep every incomplete batch and resume each; return a per-batch report.
+
+        The bulk form of :meth:`resume_publication`: lists the publications not
+        yet ``confirmed`` (oldest first), narrows to ``workflow_id`` if given,
+        and finishes each one that has values in ClickHouse. ``dry_run=True``
+        reports what *would* happen without mutating anything. A batch that
+        cannot be resumed (values never landed) is reported as ``"skipped"`` and
+        does not abort the sweep.
+        """
+        return await recover_incomplete(self, workflow_id=workflow_id, limit=limit, dry_run=dry_run)
 
     def _sqlalchemy_url(self) -> str:
         return f"postgresql+psycopg://{self._dsn.split('://', 1)[-1]}"

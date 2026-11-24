@@ -6,7 +6,7 @@ a named schema), so expectations derive from ``SCHEMA`` instead of
 hardcoding either layout.
 """
 
-from energydb.models import SCHEMA, Base, Edge, Node, Run, Series
+from energydb.models import SCHEMA, Base, Edge, Node, Run, RunPublication, Series
 
 
 def _metadata_key(name: str) -> str:
@@ -134,6 +134,43 @@ class TestRunModel:
         assert [c.name for c in Run.__table__.primary_key.columns] == ["run_id"]
 
 
+class TestRunPublicationModel:
+    """The publication state row: one per run, cascading with the run row."""
+
+    def test_table_name(self):
+        assert RunPublication.__tablename__ == "run_publication"
+        assert RunPublication.__table__.schema == SCHEMA
+
+    def test_columns(self):
+        col_names = {c.name for c in RunPublication.__table__.columns}
+        assert col_names == {
+            "run_id",
+            "state",
+            "values_written_at",
+            "confirmed_at",
+            "created_at",
+            "updated_at",
+            "last_error",
+        }
+
+    def test_primary_key_is_the_run(self):
+        assert [c.name for c in RunPublication.__table__.primary_key.columns] == ["run_id"]
+
+    def test_fk_cascades_from_runs(self):
+        """The write path's orphan-run compensation is a ``DELETE FROM runs``;
+        the publication row must go with it, or the batch state outlives the
+        metadata it describes."""
+        fk = next(iter(RunPublication.__table__.c.run_id.foreign_keys))
+        assert "runs.run_id" in str(fk.column)
+        assert fk.ondelete == "CASCADE"
+
+    def test_state_check_covers_the_vocabulary(self):
+        checks = {c.name: str(c.sqltext) for c in RunPublication.__table__.constraints if getattr(c, "name", None)}
+        state_check = checks["run_publication_state_valid"]
+        for state in ("pending", "confirmed", "failed", "reopened"):
+            assert state in state_check
+
+
 class TestNamespaceTenancy:
     """The namespace partition key is structural: composite FKs make
     cross-namespace children/edges/series unrepresentable."""
@@ -159,5 +196,5 @@ class TestNamespaceTenancy:
 
 
 def test_base_has_expected_tables():
-    for name in ("node", "edge", "series", "runs"):
+    for name in ("node", "edge", "series", "runs", "run_publication"):
         assert _metadata_key(name) in Base.metadata.tables

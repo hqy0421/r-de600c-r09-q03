@@ -225,6 +225,59 @@ class Run(Base):
     )
 
 
+class RunPublication(Base):
+    """The publication state of one batch (one ``run_id``) across both backends.
+
+    A batch's values live in ClickHouse and its metadata in PostgreSQL, and the
+    two cannot commit atomically. This row is the explicit state machine that
+    bridges them, so a half-finished batch is *identifiable* rather than merely
+    inferable:
+
+    * ``pending`` — registered with its ``runs`` row; values not yet confirmed.
+    * ``confirmed`` — values acknowledged by ClickHouse and the run recorded;
+      the only state reads will serve.
+    * ``failed`` — the value write raised; left for recovery to finish or
+      abandon.
+    * ``reopened`` — a previously confirmed batch withdrawn for repair; hidden
+      from reads until re-confirmed.
+
+    The one-row-per-run invariant is the PK, and the ``ON DELETE CASCADE`` FK
+    to ``runs`` means the write path's existing orphan-row compensation (a
+    ``DELETE`` against ``runs``) also clears the publication, keeping the two
+    tables consistent without a second statement.
+    """
+
+    __tablename__ = "run_publication"
+
+    run_id = sa.Column(
+        sa.BigInteger,
+        sa.ForeignKey(_fk("runs.run_id"), ondelete="CASCADE"),
+        primary_key=True,
+    )
+    state = sa.Column(sa.Text, nullable=False, server_default=sa.text("'pending'"))
+    values_written_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
+    confirmed_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
+    created_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
+    updated_at = sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
+    last_error = sa.Column(sa.Text, nullable=True)
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            "state IN ('pending','confirmed','failed','reopened')",
+            name="run_publication_state_valid",
+        ),
+        # The lookup that matters — "which batches still need finishing" — is
+        # over the small exception set, and a partial index keeps it cheap as
+        # the confirmed history grows.
+        sa.Index(
+            "ix_run_publication_incomplete",
+            "state",
+            postgresql_where=sa.text("state <> 'confirmed'"),
+        ),
+        {"schema": SCHEMA},
+    )
+
+
 # A no-op for the default public schema, which always exists and whose CREATE
 # privilege would be a needless ask.
 #

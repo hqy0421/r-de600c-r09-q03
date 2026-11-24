@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
+import inspect
 import logging
 import os
 import re
@@ -39,7 +41,7 @@ from energydb._join import (
     partition_node_by_path,
 )
 from energydb._persist import apply_manifest_unit_conversion
-from energydb.errors import UnchangedScopeError, ValidationError
+from energydb.errors import PublicationConfirmationError, UnchangedScopeError, ValidationError
 from energydb.models import SCHEMA
 from energydb.models import SQL_SCHEMA_PREFIX as P
 from energydb.paths import OnMissing, ResolveSummary, _check_on_missing, resolve_manifest
@@ -193,6 +195,22 @@ async def write_manifest(
     explicit ``run_id`` may reference earlier successful batches, so its
     upserted row stays. Without ``knowledge_time`` the transactional path is
     kept, because the OVERLAPPING check must be able to roll back the run row.
+
+    Publication state: the folded upsert also writes a ``run_publication`` row
+    in state ``pending`` (see :mod:`energydb.runs`). Values are written to
+    ClickHouse while the batch is still ``pending``, so reads exclude it; only
+    after ClickHouse acknowledges does :func:`_confirm` flip it to
+    ``confirmed``, which is the moment the batch becomes readable. Both
+    failure windows are therefore recoverable by run_id:
+
+    * the CH write raises → the publication is marked ``failed`` (best effort)
+      and the error propagates; the values may be partially present, so the
+      batch stays hidden until :meth:`~energydb.AsyncClient.resume_publication`
+      or an idempotent re-run finishes it;
+    * the values land but recording the confirmation fails (PG unreachable in
+      the gap) → :class:`~energydb.errors.PublicationConfirmationError` is
+      raised carrying the run_id, and the batch stays ``pending`` and hidden
+      until recovery confirms it. The write itself succeeded.
     """
     rid = run_id if run_id is not None else runs_mod.generate_run_id()
     run = runs_mod.RunRow(
@@ -270,20 +288,60 @@ async def write_manifest(
     # synchronous, hence the worker thread. It needs the id set only for the
     # per-series comparison and rejects it alongside any other scope.
     kt_scoped = summary.overlapping_series_ids if (skip_unchanged and unchanged_scope == "auto") else None
-    counts = await asyncio.to_thread(
-        td.write,
-        write_df,
-        knowledge_time=knowledge_time,
-        skip_unchanged=skip_unchanged,
-        unchanged_scope=unchanged_scope,
-        knowledge_time_scoped_series=kt_scoped,
-    )
+    try:
+        counts = await asyncio.to_thread(
+            td.write,
+            write_df,
+            knowledge_time=knowledge_time,
+            skip_unchanged=skip_unchanged,
+            unchanged_scope=unchanged_scope,
+            knowledge_time_scoped_series=kt_scoped,
+        )
+    except BaseException as exc:
+        # The values may be partially in ClickHouse (timedb runs the
+        # series_values and run_series lanes concurrently). Record the failure
+        # so the batch is locatable, but never let a bookkeeping failure mask
+        # the real error: a row left `pending` is still findable by run_id.
+        with contextlib.suppress(Exception):
+            async with client._pool.connection() as conn:
+                await runs_mod.mark_publication_failed(conn, rid, f"{type(exc).__name__}: {exc}")
+                await conn.commit()
+        raise
+
+    # The values are in ClickHouse; flip the publication to confirmed so reads
+    # begin serving this version. This is the "data written, run record not
+    # written" boundary: if PG is unreachable here the values exist but stay
+    # hidden (pending), and the raised error names the run_id to resume.
+    await _confirm(client, rid)
     return WriteResult(rid, counts.written, counts.skipped)
+
+
+async def _confirm(client, rid: int) -> None:
+    """Flip ``rid``'s publication to ``confirmed``; raise
+    :class:`~energydb.errors.PublicationConfirmationError` if PG can't record it.
+
+    The values already reached ClickHouse, so a failure here is *not* a failed
+    write — it is an incomplete confirmation the scheduler finishes with
+    :meth:`~energydb.AsyncClient.resume_publication`. Wrapped so the caller can
+    distinguish "write failed" from "written, not yet confirmed" by type.
+    """
+    try:
+        async with client._pool.connection() as conn:
+            await runs_mod.confirm_publication(conn, rid)
+            await conn.commit()
+    except Exception as exc:
+        raise PublicationConfirmationError(
+            f"values for run_id={rid} were written to ClickHouse and will become readable once "
+            f"confirmed, but recording the confirmation failed: {exc}. The batch is left pending and "
+            f"hidden; call client.resume_publication({rid}) once PostgreSQL is reachable.",
+            run_id=rid,
+            state=runs_mod.PENDING,
+        ) from exc
 
 
 # Scoping the annotation to energydb's own relations keeps it off a host
 # application's missing tables, which have nothing to do with ENERGYDB_SCHEMA.
-_ENERGYDB_RELATIONS = frozenset({"node", "edge", "series", "runs", "series_meta"})
+_ENERGYDB_RELATIONS = frozenset({"node", "edge", "series", "runs", "run_publication", "series_meta"})
 
 _RELATION_RE = re.compile(r'relation "([^"]+)" does not exist')
 
@@ -460,6 +518,30 @@ def _is_unknown_table(exc: BaseException | None) -> bool:
     return False
 
 
+def _callable_params(fn) -> frozenset[str] | None:
+    """Accepted parameter names of ``fn``; ``None`` when it takes ``**kwargs``.
+
+    Bound methods are unwrapped first so ``inspect.signature`` sees the plain
+    function rather than an already-bound one.
+    """
+    target = getattr(fn, "__func__", fn)
+    try:
+        sig = inspect.signature(target)
+    except (TypeError, ValueError):
+        # Builtin or otherwise unintrospectable: assume it accepts everything,
+        # which is what the caller would have done before this check existed.
+        return None
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return None
+    return frozenset(sig.parameters)
+
+
+# Dropping one of these when the installed timedb does not declare it changes
+# nothing: ``bucket_dedup`` only modifies a ``bucket_us`` request, and a True
+# default is indistinguishable from not passing it.
+_HARMLESS_WHEN_UNSUPPORTED = frozenset({"bucket_dedup"})
+
+
 def _td_call(
     td,
     *,
@@ -474,7 +556,30 @@ def _td_call(
     the read's bitemporal/window arguments; ``meta_source`` (the concurrent
     path) makes the CH query self-resolve its ``series_id`` set via the
     PostgreSQL engine table instead of the id array.
+
+    ``kwargs`` are filtered against the installed reader's signature, because
+    energydb and timedb are separately versioned: a deployment can pin a timedb
+    whose read surface predates a kwarg this energydb offers (row bucketing,
+    say). Passing it anyway would turn *every* read into a ``TypeError``, so
+    unsupported arguments whose value requests nothing (``None`` / ``False`` /
+    the ``bucket_dedup`` default) are dropped, and an unsupported argument the
+    caller actually asked for raises instead of being silently ignored — a
+    dropped ``bucket_us`` changes the shape of the answer.
     """
+    reader = td.read_relative if relative else td.read
+    accepted = _callable_params(reader)
+    if accepted is not None:
+        for key in [k for k in kwargs if k not in accepted]:
+            value = kwargs[key]
+            if value is None or value is False or key in _HARMLESS_WHEN_UNSUPPORTED:
+                kwargs.pop(key)
+                continue
+            raise ValidationError(
+                f"the installed timedb does not support the {key!r} read argument "
+                f"(its {'read_relative' if relative else 'read'}() has no such parameter). "
+                "Upgrade timedb to a version whose read surface includes it."
+            )
+
     if relative:
 
         def _call(series_ids: list[int], retentions: list[str] | None) -> pl.DataFrame:

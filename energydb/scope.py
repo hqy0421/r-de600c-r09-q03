@@ -264,6 +264,15 @@ class _BaseScope:
     def _td(self):
         return self._client.td
 
+    async def _read_td(self):
+        """The publication-gated ``TimeDBClient`` reads should use.
+
+        Delegates to :meth:`energydb.AsyncClient._read_td`; reads go through it
+        so unconfirmed batches are excluded, while writes keep the plain
+        :attr:`_td`. See that method for the gate's cost and semantics.
+        """
+        return await self._client._read_td()
+
     @asynccontextmanager
     async def _use_conn(self):
         """Yield a DB connection. Inside a txn, use the txn's connection
@@ -571,7 +580,7 @@ class _BaseScope:
         # on_missing to expose and the third element is always empty.
         result, n_series, _missing = await execute_read(
             self._pool,
-            self._td,
+            await self._read_td(),
             self._client,
             resolve=lambda: self._build_resolved_meta(data_type=data_type, name=name),
             is_edge=(self._owner_col == "edge_uuid"),
@@ -647,7 +656,7 @@ class _BaseScope:
 
         result, n_series, _missing = await execute_read(
             self._pool,
-            self._td,
+            await self._read_td(),
             self._client,
             resolve=_instant_resolve,
             is_edge=(self._owner_col == "edge_uuid"),
@@ -692,7 +701,7 @@ class _BaseScope:
             _ts_io_unsupported_in_txn("read_relative")
         result, n_series, _missing = await execute_read(
             self._pool,
-            self._td,
+            await self._read_td(),
             self._client,
             resolve=lambda: self._build_resolved_meta(data_type=data_type, name=name),
             is_edge=(self._owner_col == "edge_uuid"),

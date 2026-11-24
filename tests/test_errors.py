@@ -89,8 +89,48 @@ def test_manifest_error_is_a_validation_error():
     assert issubclass(ManifestError, ValidationError)
 
 
+def test_publication_errors_form_their_own_subtree():
+    """Publication failures are *operational* (a batch is mid-state), not
+    invalid input, so the root is not a ``ValueError``. The two that mirror a
+    bad request — a disallowed transition and a missing batch — are still
+    ``ValueError``s (via ``ValidationError`` / ``NotFoundError``), preserving
+    the old ``except ValueError`` contract at exactly the sites where the
+    pre-taxonomy code raised one.
+    """
+    from energydb.errors import (
+        PublicationConfirmationError,
+        PublicationError,
+        PublicationNotFoundError,
+        PublicationStateError,
+    )
+
+    assert issubclass(PublicationError, EnergyDBError)
+    assert not issubclass(PublicationError, ValueError)
+    assert issubclass(PublicationStateError, PublicationError)
+    assert issubclass(PublicationStateError, ValidationError)
+    assert issubclass(PublicationNotFoundError, PublicationError)
+    assert issubclass(PublicationNotFoundError, NotFoundError)
+    # "values written but confirmation not recorded" is not a caller error.
+    assert issubclass(PublicationConfirmationError, PublicationError)
+    assert not issubclass(PublicationConfirmationError, ValueError)
+
+
+def test_publication_errors_carry_the_run_id():
+    from energydb.errors import PublicationStateError
+
+    err = PublicationStateError("boom", run_id=7, state="pending")
+    assert err.run_id == 7 and err.state == "pending"
+    assert str(err) == "boom"
+
+
 def test_taxonomy_is_re_exported_from_the_package_root():
-    for cls in [EnergyDBError, *PUBLIC_ERRORS]:
+    publication = [
+        edb.PublicationError,
+        edb.PublicationStateError,
+        edb.PublicationNotFoundError,
+        edb.PublicationConfirmationError,
+    ]
+    for cls in [EnergyDBError, *PUBLIC_ERRORS, *publication]:
         assert getattr(edb, cls.__name__) is cls
         assert cls.__name__ in edb.__all__
 

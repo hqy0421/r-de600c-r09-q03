@@ -195,6 +195,57 @@ class UnchangedScopeError(ValidationError):
         )
 
 
+class PublicationError(EnergyDBError):
+    """Base class for publication (run/batch) state-machine failures.
+
+    A *publication* is one ``run_id``: its ``runs`` row in PostgreSQL plus the
+    ClickHouse values stamped with that id. The two live in different backends
+    and cannot commit atomically, so a publication moves through explicit
+    states (``pending`` → ``confirmed``, with ``failed`` and ``reopened`` as
+    the recovery and withdrawal states) instead of being implied by a single
+    commit. Every error below carries ``run_id`` so a scheduler can locate the
+    batch it has to finish instead of retrying blind.
+    """
+
+    def __init__(self, message: str, *, run_id: int | None = None):
+        super().__init__(message)
+        self.run_id = run_id
+
+
+class PublicationStateError(PublicationError, ValidationError):
+    """The requested publication transition is not allowed.
+
+    Examples: resuming a batch that is already ``confirmed`` (reopen it first),
+    or confirming a batch whose values never reached ClickHouse. ``state`` is
+    the batch's current state, when known.
+    """
+
+    def __init__(self, message: str, *, run_id: int | None = None, state: str | None = None):
+        super().__init__(message, run_id=run_id)
+        self.state = state
+
+
+class PublicationNotFoundError(PublicationError, NotFoundError):
+    """No publication exists for the addressed ``run_id``."""
+
+
+class PublicationConfirmationError(PublicationError):
+    """Values reached ClickHouse but recording the confirmation failed.
+
+    The write itself succeeded: ClickHouse acknowledged the batch, and the
+    reads that exclude unconfirmed runs will not expose it until the ``runs``
+    row is flipped to ``confirmed``. This happens when PostgreSQL is briefly
+    unreachable between the value insert and the confirmation (the "data
+    written, run record not written" window), so the batch is *not* lost —
+    :meth:`~energydb.AsyncClient.resume_publication` finishes it once PG is
+    back. The original database error rides along as ``__cause__``.
+    """
+
+    def __init__(self, message: str, *, run_id: int | None = None, state: str | None = None):
+        super().__init__(message, run_id=run_id)
+        self.state = state
+
+
 class ConfigurationError(EnergyDBError, ValueError):
     """Client or environment misconfiguration (unusable conninfo, …)."""
 
@@ -226,6 +277,10 @@ __all__ = [
     "ManifestError",
     "NodeNotFoundError",
     "NotFoundError",
+    "PublicationConfirmationError",
+    "PublicationError",
+    "PublicationNotFoundError",
+    "PublicationStateError",
     "SeriesNotFoundError",
     "UnchangedScopeError",
     "UnknownElementTypeError",

@@ -59,9 +59,9 @@ def test_a_schema_qualified_name_is_reduced_to_the_relation():
 
 
 def test_every_energydb_relation_is_covered():
-    """The four tables plus the ``series_meta`` view: the set the annotation is
+    """The tables plus the ``series_meta`` view: the set the annotation is
     scoped to, so a host application's own missing tables stay unannotated."""
-    assert set(_ENERGYDB_RELATIONS) == {"node", "edge", "series", "runs", "series_meta"}
+    assert set(_ENERGYDB_RELATIONS) == {"node", "edge", "series", "runs", "run_publication", "series_meta"}
 
 
 def test_an_unparseable_message_yields_none_rather_than_raising():
